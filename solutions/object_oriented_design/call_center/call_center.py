@@ -1,536 +1,533 @@
+import threading
+import time
+import heapq
 from abc import ABCMeta, abstractmethod
 from collections import deque
 from enum import Enum
-import time
-import threading
+from typing import Optional, List, Dict
 import logging
-from functools import wraps
-from typing import Callable, Any, Optional
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime
+import random
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-# Resilience Layer Implementation
-class CircuitState(Enum):
-    CLOSED = 0
-    OPEN = 1
-    HALF_OPEN = 2
-
-
-class CircuitBreaker:
-    """Circuit breaker pattern implementation with state machine."""
-    
-    def __init__(self, failure_threshold: int = 5, reset_timeout: float = 30.0, 
-                 half_open_max_calls: int = 1):
-        self.failure_threshold = failure_threshold
-        self.reset_timeout = reset_timeout
-        self.half_open_max_calls = half_open_max_calls
-        
-        self.state = CircuitState.CLOSED
-        self.failure_count = 0
-        self.last_failure_time = None
-        self.half_open_calls = 0
-        self._lock = threading.RLock()
-        
-        # Monitoring hooks
-        self.on_state_change = None
-        self.on_failure = None
-        self.on_success = None
-        
-    def __call__(self, func: Callable) -> Callable:
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            return self.call(func, *args, **kwargs)
-        return wrapper
-    
-    def call(self, func: Callable, *args, **kwargs) -> Any:
-        with self._lock:
-            if self.state == CircuitState.OPEN:
-                if self._should_attempt_reset():
-                    self.state = CircuitState.HALF_OPEN
-                    self.half_open_calls = 0
-                    if self.on_state_change:
-                        self.on_state_change(CircuitState.OPEN, CircuitState.HALF_OPEN)
-                else:
-                    raise CircuitOpenError(f"Circuit is OPEN for {func.__name__}")
-            
-            if self.state == CircuitState.HALF_OPEN:
-                if self.half_open_calls >= self.half_open_max_calls:
-                    raise CircuitOpenError(f"Circuit is HALF_OPEN but max calls reached for {func.__name__}")
-                self.half_open_calls += 1
-        
-        try:
-            result = func(*args, **kwargs)
-            self._on_success()
-            return result
-        except Exception as e:
-            self._on_failure()
-            raise
-    
-    def _should_attempt_reset(self) -> bool:
-        return (self.last_failure_time and 
-                time.time() - self.last_failure_time >= self.reset_timeout)
-    
-    def _on_success(self):
-        with self._lock:
-            if self.state == CircuitState.HALF_OPEN:
-                self.state = CircuitState.CLOSED
-                if self.on_state_change:
-                    self.on_state_change(CircuitState.HALF_OPEN, CircuitState.CLOSED)
-            self.failure_count = 0
-            self.half_open_calls = 0
-            if self.on_success:
-                self.on_success()
-    
-    def _on_failure(self):
-        with self._lock:
-            self.failure_count += 1
-            self.last_failure_time = time.time()
-            
-            if self.on_failure:
-                self.on_failure(self.failure_count)
-            
-            if (self.state == CircuitState.CLOSED and 
-                self.failure_count >= self.failure_threshold):
-                self.state = CircuitState.OPEN
-                if self.on_state_change:
-                    self.on_state_change(CircuitState.CLOSED, CircuitState.OPEN)
-            elif self.state == CircuitState.HALF_OPEN:
-                self.state = CircuitState.OPEN
-                if self.on_state_change:
-                    self.on_state_change(CircuitState.HALF_OPEN, CircuitState.OPEN)
-
-
-class RetryPolicy:
-    """Retry policy with exponential backoff and jitter."""
-    
-    def __init__(self, max_retries: int = 3, base_delay: float = 1.0,
-                 max_delay: float = 30.0, exponential_base: float = 2.0,
-                 jitter: bool = True):
-        self.max_retries = max_retries
-        self.base_delay = base_delay
-        self.max_delay = max_delay
-        self.exponential_base = exponential_base
-        self.jitter = jitter
-        
-        # Monitoring hooks
-        self.on_retry = None
-        self.on_failure = None
-    
-    def __call__(self, func: Callable) -> Callable:
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            return self.execute(func, *args, **kwargs)
-        return wrapper
-    
-    def execute(self, func: Callable, *args, **kwargs) -> Any:
-        last_exception = None
-        
-        for attempt in range(self.max_retries + 1):
-            try:
-                return func(*args, **kwargs)
-            except Exception as e:
-                last_exception = e
-                
-                if attempt == self.max_retries:
-                    if self.on_failure:
-                        self.on_failure(attempt + 1, e)
-                    raise
-                
-                delay = self._calculate_delay(attempt)
-                if self.on_retry:
-                    self.on_retry(attempt + 1, delay, e)
-                
-                time.sleep(delay)
-        
-        raise last_exception
-    
-    def _calculate_delay(self, attempt: int) -> float:
-        delay = min(
-            self.base_delay * (self.exponential_base ** attempt),
-            self.max_delay
-        )
-        
-        if self.jitter:
-            import random
-            delay = random.uniform(0, delay)
-        
-        return delay
-
-
-class Bulkhead:
-    """Bulkhead pattern for thread pool isolation."""
-    
-    def __init__(self, max_concurrent: int = 10, max_waiting: int = 100):
-        self.max_concurrent = max_concurrent
-        self.max_waiting = max_waiting
-        self._executor = ThreadPoolExecutor(max_workers=max_concurrent)
-        self._semaphore = threading.Semaphore(max_waiting)
-        
-        # Monitoring hooks
-        self.on_rejected = None
-        self.on_complete = None
-    
-    def __call__(self, func: Callable) -> Callable:
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            return self.execute(func, *args, **kwargs)
-        return wrapper
-    
-    def execute(self, func: Callable, *args, **kwargs) -> Any:
-        if not self._semaphore.acquire(blocking=False):
-            if self.on_rejected:
-                self.on_rejected(func.__name__)
-            raise BulkheadFullError(f"Bulkhead full for {func.__name__}")
-        
-        try:
-            future = self._executor.submit(func, *args, **kwargs)
-            result = future.result()
-            if self.on_complete:
-                self.on_complete(func.__name__)
-            return result
-        finally:
-            self._semaphore.release()
-    
-    def shutdown(self):
-        self._executor.shutdown(wait=True)
-
-
-class ResilientService:
-    """Composite resilience decorator combining all patterns."""
-    
-    def __init__(self, 
-                 circuit_breaker: Optional[CircuitBreaker] = None,
-                 retry_policy: Optional[RetryPolicy] = None,
-                 bulkhead: Optional[Bulkhead] = None,
-                 fallback: Optional[Callable] = None):
-        self.circuit_breaker = circuit_breaker
-        self.retry_policy = retry_policy
-        self.bulkhead = bulkhead
-        self.fallback = fallback
-        
-        # Set up monitoring chain
-        self._setup_monitoring()
-    
-    def _setup_monitoring(self):
-        """Chain monitoring events from all components."""
-        if self.circuit_breaker:
-            self.circuit_breaker.on_state_change = self._on_circuit_state_change
-            self.circuit_breaker.on_failure = self._on_circuit_failure
-            self.circuit_breaker.on_success = self._on_circuit_success
-        
-        if self.retry_policy:
-            self.retry_policy.on_retry = self._on_retry
-            self.retry_policy.on_failure = self._on_retry_failure
-        
-        if self.bulkhead:
-            self.bulkhead.on_rejected = self._on_bulkhead_rejected
-            self.bulkhead.on_complete = self._on_bulkhead_complete
-    
-    def __call__(self, func: Callable) -> Callable:
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            return self.execute(func, *args, **kwargs)
-        return wrapper
-    
-    def execute(self, func: Callable, *args, **kwargs) -> Any:
-        try:
-            # Apply bulkhead first to limit concurrency
-            if self.bulkhead:
-                return self.bulkhead.execute(
-                    self._wrap_with_circuit_and_retry(func),
-                    *args, **kwargs
-                )
-            else:
-                return self._wrap_with_circuit_and_retry(func)(*args, **kwargs)
-        except (CircuitOpenError, BulkheadFullError) as e:
-            if self.fallback:
-                logging.warning(f"Using fallback for {func.__name__}: {e}")
-                return self.fallback(*args, **kwargs)
-            raise
-    
-    def _wrap_with_circuit_and_retry(self, func: Callable) -> Callable:
-        """Apply circuit breaker and retry policy in correct order."""
-        wrapped = func
-        
-        # Apply retry policy first (innermost)
-        if self.retry_policy:
-            wrapped = self.retry_policy(wrapped)
-        
-        # Then apply circuit breaker
-        if self.circuit_breaker:
-            wrapped = self.circuit_breaker(wrapped)
-        
-        return wrapped
-    
-    # Monitoring callbacks
-    def _on_circuit_state_change(self, old_state: CircuitState, new_state: CircuitState):
-        logging.info(f"Circuit state changed: {old_state} -> {new_state}")
-    
-    def _on_circuit_failure(self, failure_count: int):
-        logging.warning(f"Circuit failure count: {failure_count}")
-    
-    def _on_circuit_success(self):
-        logging.info("Circuit call succeeded")
-    
-    def _on_retry(self, attempt: int, delay: float, exception: Exception):
-        logging.info(f"Retry attempt {attempt} after {delay:.2f}s: {exception}")
-    
-    def _on_retry_failure(self, attempts: int, exception: Exception):
-        logging.error(f"Retry failed after {attempts} attempts: {exception}")
-    
-    def _on_bulkhead_rejected(self, func_name: str):
-        logging.warning(f"Bulkhead rejected call to {func_name}")
-    
-    def _on_bulkhead_complete(self, func_name: str):
-        logging.debug(f"Bulkhead completed call to {func_name}")
-
-
-# Custom exceptions for resilience patterns
-class CircuitOpenError(Exception):
-    pass
-
-class BulkheadFullError(Exception):
-    pass
-
-
-# Original Call Center Code with Resilience Layer
 class Rank(Enum):
     OPERATOR = 0
     SUPERVISOR = 1
     DIRECTOR = 2
 
 
-class Employee(metaclass=ABCMeta):
-
-    def __init__(self, employee_id, name, rank, call_center):
-        self.employee_id = employee_id
-        self.name = name
-        self.rank = rank
-        self.call = None
-        self.call_center = call_center
-        
-        # Resilience decorators for employee operations
-        self._take_call_resilient = ResilientService(
-            circuit_breaker=CircuitBreaker(failure_threshold=3, reset_timeout=60),
-            retry_policy=RetryPolicy(max_retries=2, base_delay=0.5),
-            fallback=self._take_call_fallback
-        )(self._take_call_impl)
-        
-        self._complete_call_resilient = ResilientService(
-            circuit_breaker=CircuitBreaker(failure_threshold=5, reset_timeout=30),
-            retry_policy=RetryPolicy(max_retries=1, base_delay=1.0)
-        )(self._complete_call_impl)
-
-    def take_call(self, call):
-        """Resilient call taking with circuit breaker and retry."""
-        return self._take_call_resilient(call)
-    
-    def _take_call_impl(self, call):
-        """Original take_call implementation."""
-        self.call = call
-        self.call.employee = self
-        self.call.state = CallState.IN_PROGRESS
-    
-    def _take_call_fallback(self, call):
-        """Fallback when take_call fails - mark call for manual handling."""
-        logging.warning(f"Fallback: Employee {self.name} cannot take call, marking for manual handling")
-        call.state = CallState.READY  # Return to queue
-        return None
-
-    def complete_call(self):
-        """Resilient call completion."""
-        return self._complete_call_resilient()
-    
-    def _complete_call_impl(self):
-        """Original complete_call implementation."""
-        self.call.state = CallState.COMPLETE
-        self.call_center.notify_call_completed(self.call)
-
-    @abstractmethod
-    def escalate_call(self):
-        pass
-
-    def _escalate_call(self):
-        self.call.state = CallState.READY
-        call = self.call
-        self.call = None
-        self.call_center.notify_call_escalated(call)
-
-
-class Operator(Employee):
-
-    def __init__(self, employee_id, name, call_center):
-        super().__init__(employee_id, name, Rank.OPERATOR, call_center)
-        
-        # Resilience for escalate_call
-        self._escalate_resilient = ResilientService(
-            circuit_breaker=CircuitBreaker(failure_threshold=2, reset_timeout=120),
-            retry_policy=RetryPolicy(max_retries=1, base_delay=2.0),
-            fallback=self._escalate_fallback
-        )(self._escalate_call_impl)
-
-    def escalate_call(self):
-        return self._escalate_resilient()
-    
-    def _escalate_call_impl(self):
-        self.call.level = Rank.SUPERVISOR
-        self._escalate_call()
-    
-    def _escalate_fallback(self):
-        """Fallback: If escalation fails, keep call with operator."""
-        logging.warning(f"Fallback: Operator {self.name} cannot escalate, keeping call")
-        # Don't escalate, just complete the call at current level
-        self.complete_call()
-
-
-class Supervisor(Employee):
-
-    def __init__(self, employee_id, name, call_center):
-        super().__init__(employee_id, name, Rank.SUPERVISOR, call_center)
-        
-        self._escalate_resilient = ResilientService(
-            circuit_breaker=CircuitBreaker(failure_threshold=2, reset_timeout=120),
-            retry_policy=RetryPolicy(max_retries=1, base_delay=2.0),
-            fallback=self._escalate_fallback
-        )(self._escalate_call_impl)
-
-    def escalate_call(self):
-        return self._escalate_resilient()
-    
-    def _escalate_call_impl(self):
-        self.call.level = Rank.DIRECTOR
-        self._escalate_call()
-    
-    def _escalate_fallback(self):
-        logging.warning(f"Fallback: Supervisor {self.name} cannot escalate, keeping call")
-        self.complete_call()
-
-
-class Director(Employee):
-
-    def __init__(self, employee_id, name, call_center):
-        super().__init__(employee_id, name, Rank.DIRECTOR, call_center)
-
-    def escalate_call(self):
-        raise NotImplementedError('Directors must be able to handle any call')
-
-
 class CallState(Enum):
     READY = 0
     IN_PROGRESS = 1
     COMPLETE = 2
+    ESCALATED = 3
 
 
-class Call(object):
+@dataclass
+class CallMetrics:
+    call_id: str
+    start_time: datetime
+    end_time: Optional[datetime] = None
+    escalations: int = 0
+    wait_time: float = 0.0
+    handle_time: float = 0.0
 
-    def __init__(self, rank):
+
+class Call:
+    def __init__(self, rank: Rank, call_id: str = None):
+        self.call_id = call_id or f"call_{int(time.time())}_{random.randint(1000, 9999)}"
         self.state = CallState.READY
         self.rank = rank
         self.employee = None
+        self.created_at = datetime.now()
+        self.assigned_at = None
+        self.completed_at = None
+        self.escalation_count = 0
+        self.priority_score = self._calculate_priority()
+        
+    def _calculate_priority(self) -> int:
+        """Calculate priority score for heap queue (lower is higher priority)"""
+        base_priority = {
+            Rank.DIRECTOR: 1,
+            Rank.SUPERVISOR: 2,
+            Rank.OPERATOR: 3
+        }[self.rank]
+        
+        # Add escalation bonus (higher escalation = higher priority)
+        escalation_bonus = -self.escalation_count * 0.1
+        
+        # Add time bonus (older calls get higher priority)
+        time_bonus = -(time.time() - self.created_at.timestamp()) * 0.01
+        
+        return base_priority + escalation_bonus + time_bonus
+    
+    def __lt__(self, other):
+        """For heap comparison"""
+        return self.priority_score < other.priority_score
+    
+    def update_priority(self):
+        """Update priority score based on current state"""
+        self.priority_score = self._calculate_priority()
 
 
-class CallCenter(object):
+class Employee(metaclass=ABCMeta):
+    def __init__(self, employee_id: str, name: str, rank: Rank, call_center: 'CallCenter'):
+        self.employee_id = employee_id
+        self.name = name
+        self.rank = rank
+        self.call: Optional[Call] = None
+        self.call_center = call_center
+        self.lock = threading.RLock()
+        self.is_available = True
+        self.circuit_breaker_failures = 0
+        self.circuit_breaker_threshold = 3
+        self.circuit_breaker_timeout = 30  # seconds
+        self.last_failure_time = None
+        
+    def take_call(self, call: Call) -> bool:
+        """Thread-safe call assignment with circuit breaker check"""
+        with self.lock:
+            if not self.is_available:
+                return False
+                
+            if self._is_circuit_breaker_open():
+                logger.warning(f"Circuit breaker open for {self.name}, rejecting call {call.call_id}")
+                return False
+                
+            self.call = call
+            self.call.employee = self
+            self.call.state = CallState.IN_PROGRESS
+            self.call.assigned_at = datetime.now()
+            self.is_available = False
+            
+            # Update metrics
+            if self.call.assigned_at and self.call.created_at:
+                self.call.wait_time = (self.call.assigned_at - self.call.created_at).total_seconds()
+                
+            logger.info(f"{self.name} ({self.rank.name}) taking call {call.call_id}")
+            return True
+            
+    def complete_call(self) -> None:
+        """Complete current call and update metrics"""
+        with self.lock:
+            if not self.call:
+                return
+                
+            self.call.state = CallState.COMPLETE
+            self.call.completed_at = datetime.now()
+            
+            if self.call.completed_at and self.call.assigned_at:
+                self.call.handle_time = (self.call.completed_at - self.call.assigned_at).total_seconds()
+                
+            logger.info(f"{self.name} completed call {self.call.call_id} "
+                       f"(wait: {self.call.wait_time:.2f}s, handle: {self.call.handle_time:.2f}s)")
+            
+            # Reset circuit breaker on successful completion
+            self.circuit_breaker_failures = 0
+            self.last_failure_time = None
+            
+            completed_call = self.call
+            self.call = None
+            self.is_available = True
+            
+            self.call_center.notify_call_completed(completed_call)
+            
+    def escalate_call(self) -> bool:
+        """Escalate call with circuit breaker protection"""
+        with self.lock:
+            if not self.call:
+                return False
+                
+            try:
+                if self._is_circuit_breaker_open():
+                    logger.warning(f"Circuit breaker open for {self.name}, cannot escalate call {self.call.call_id}")
+                    return False
+                    
+                self.call.state = CallState.ESCALATED
+                self.call.escalation_count += 1
+                self.call.update_priority()
+                
+                call = self.call
+                self.call = None
+                self.is_available = True
+                
+                logger.info(f"{self.name} escalating call {call.call_id} "
+                          f"(escalation #{call.escalation_count})")
+                
+                self.call_center.notify_call_escalated(call)
+                return True
+                
+            except Exception as e:
+                self.circuit_breaker_failures += 1
+                self.last_failure_time = datetime.now()
+                logger.error(f"Escalation failed for {self.name}: {str(e)}")
+                return False
+                
+    def _is_circuit_breaker_open(self) -> bool:
+        """Check if circuit breaker is open"""
+        if self.circuit_breaker_failures >= self.circuit_breaker_threshold:
+            if self.last_failure_time:
+                time_since_failure = (datetime.now() - self.last_failure_time).total_seconds()
+                if time_since_failure < self.circuit_breaker_timeout:
+                    return True
+                else:
+                    # Reset circuit breaker after timeout
+                    self.circuit_breaker_failures = 0
+                    self.last_failure_time = None
+        return False
+        
+    @abstractmethod
+    def _escalate_call(self):
+        pass
 
-    def __init__(self, operators, supervisors, directors):
+
+class Operator(Employee):
+    def __init__(self, employee_id: str, name: str, call_center: 'CallCenter'):
+        super().__init__(employee_id, name, Rank.OPERATOR, call_center)
+        
+    def escalate_call(self) -> bool:
+        if self.call:
+            self.call.rank = Rank.SUPERVISOR
+        return super().escalate_call()
+        
+    def _escalate_call(self):
+        pass
+
+
+class Supervisor(Employee):
+    def __init__(self, employee_id: str, name: str, call_center: 'CallCenter'):
+        super().__init__(employee_id, name, Rank.SUPERVISOR, call_center)
+        
+    def escalate_call(self) -> bool:
+        if self.call:
+            self.call.rank = Rank.DIRECTOR
+        return super().escalate_call()
+        
+    def _escalate_call(self):
+        pass
+
+
+class Director(Employee):
+    def __init__(self, employee_id: str, name: str, call_center: 'CallCenter'):
+        super().__init__(employee_id, name, Rank.DIRECTOR, call_center)
+        
+    def escalate_call(self) -> bool:
+        # Directors cannot escalate further
+        logger.warning(f"Director {self.name} cannot escalate call {self.call.call_id if self.call else 'None'}")
+        return False
+        
+    def _escalate_call(self):
+        pass
+
+
+class LoadBalancer:
+    """Load balancer for distributing calls across employees"""
+    
+    def __init__(self, call_center: 'CallCenter'):
+        self.call_center = call_center
+        self.lock = threading.RLock()
+        self.employee_loads: Dict[str, int] = {}
+        
+    def get_least_loaded_employee(self, rank: Rank) -> Optional[Employee]:
+        """Get the least loaded employee of specified rank or higher"""
+        with self.lock:
+            available_employees = []
+            
+            # Check employees of the specified rank and higher ranks
+            for check_rank in [rank, Rank.SUPERVISOR, Rank.DIRECTOR]:
+                employees = self.call_center.get_available_employees(check_rank)
+                for employee in employees:
+                    load = self.employee_loads.get(employee.employee_id, 0)
+                    available_employees.append((load, employee))
+                    
+            if not available_employees:
+                return None
+                
+            # Sort by load (ascending) and return the least loaded
+            available_employees.sort(key=lambda x: x[0])
+            return available_employees[0][1]
+            
+    def update_load(self, employee: Employee, delta: int = 1) -> None:
+        """Update load for an employee"""
+        with self.lock:
+            current_load = self.employee_loads.get(employee.employee_id, 0)
+            self.employee_loads[employee.employee_id] = max(0, current_load + delta)
+
+
+class MetricsCollector:
+    """Collect and report system metrics"""
+    
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.total_calls = 0
+        self.completed_calls = 0
+        self.escalated_calls = 0
+        self.dropped_calls = 0
+        self.total_wait_time = 0.0
+        self.total_handle_time = 0.0
+        self.call_metrics: List[CallMetrics] = []
+        
+    def record_call_start(self, call: Call) -> None:
+        with self.lock:
+            self.total_calls += 1
+            metrics = CallMetrics(
+                call_id=call.call_id,
+                start_time=call.created_at
+            )
+            self.call_metrics.append(metrics)
+            
+    def record_call_completion(self, call: Call) -> None:
+        with self.lock:
+            self.completed_calls += 1
+            if call.wait_time:
+                self.total_wait_time += call.wait_time
+            if call.handle_time:
+                self.total_handle_time += call.handle_time
+                
+    def record_call_escalation(self, call: Call) -> None:
+        with self.lock:
+            self.escalated_calls += 1
+            
+    def record_call_drop(self, call: Call) -> None:
+        with self.lock:
+            self.dropped_calls += 1
+            
+    def get_metrics(self) -> Dict:
+        with self.lock:
+            avg_wait_time = (self.total_wait_time / self.completed_calls 
+                           if self.completed_calls > 0 else 0)
+            avg_handle_time = (self.total_handle_time / self.completed_calls 
+                             if self.completed_calls > 0 else 0)
+            
+            return {
+                "total_calls": self.total_calls,
+                "completed_calls": self.completed_calls,
+                "escalated_calls": self.escalated_calls,
+                "dropped_calls": self.dropped_calls,
+                "avg_wait_time": avg_wait_time,
+                "avg_handle_time": avg_handle_time,
+                "completion_rate": (self.completed_calls / self.total_calls * 100 
+                                  if self.total_calls > 0 else 0)
+            }
+            
+    def print_metrics(self) -> None:
+        metrics = self.get_metrics()
+        logger.info("=== Call Center Metrics ===")
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                logger.info(f"{key}: {value:.2f}")
+            else:
+                logger.info(f"{key}: {value}")
+
+
+class CallCenter:
+    def __init__(self, operators: List[Operator], supervisors: List[Supervisor], 
+                 directors: List[Director]):
         self.operators = operators
         self.supervisors = supervisors
         self.directors = directors
-        self.queued_calls = deque()
         
-        # Resilience for dispatch operations
-        self._dispatch_resilient = ResilientService(
-            circuit_breaker=CircuitBreaker(failure_threshold=10, reset_timeout=60),
-            retry_policy=RetryPolicy(max_retries=2, base_delay=1.0),
-            bulkhead=Bulkhead(max_concurrent=50, max_waiting=200),
-            fallback=self._dispatch_fallback
-        )(self._dispatch_call_impl)
+        # Thread-safe data structures
+        self.call_queue = []  # Priority queue (heap)
+        self.queue_lock = threading.RLock()
+        self.queue_condition = threading.Condition(self.queue_lock)
         
-        # Bulkhead for queued call processing
-        self._queue_processor = Bulkhead(max_concurrent=10)
+        # Employee availability tracking
+        self.available_employees = {
+            Rank.OPERATOR: set(operators),
+            Rank.SUPERVISOR: set(supervisors),
+            Rank.DIRECTOR: set(directors)
+        }
+        self.employee_lock = threading.RLock()
         
-        # Start queue processor thread
-        self._queue_thread = threading.Thread(target=self._process_queue, daemon=True)
-        self._queue_thread.start()
-    
-    def dispatch_call(self, call):
-        """Resilient call dispatch with bulkhead isolation."""
-        return self._dispatch_resilient(call)
-    
-    def _dispatch_call_impl(self, call):
-        """Original dispatch implementation."""
-        if call.rank not in (Rank.OPERATOR, Rank.SUPERVISOR, Rank.DIRECTOR):
-            raise ValueError('Invalid call rank: {}'.format(call.rank))
+        # Components
+        self.load_balancer = LoadBalancer(self)
+        self.metrics = MetricsCollector()
         
-        employee = None
-        if call.rank == Rank.OPERATOR:
-            employee = self._dispatch_to_employee(call, self.operators)
-        if call.rank == Rank.SUPERVISOR or employee is None:
-            employee = self._dispatch_to_employee(call, self.supervisors)
-        if call.rank == Rank.DIRECTOR or employee is None:
-            employee = self._dispatch_to_employee(call, self.directors)
+        # Worker threads
+        self.dispatcher_thread = threading.Thread(target=self._dispatcher_loop, daemon=True)
+        self.dispatcher_running = True
+        self.dispatcher_thread.start()
         
-        if employee is None:
-            self.queued_calls.append(call)
+        # Start employee threads
+        self._start_employee_threads()
         
-        return employee
-    
-    def _dispatch_to_employee(self, call, employees):
-        """Dispatch to specific employee group with resilience."""
-        for employee in employees:
-            if employee.call is None:
-                try:
-                    employee.take_call(call)
-                    return employee
-                except (CircuitOpenError, BulkheadFullError):
-                    continue  # Try next employee
-        return None
-    
-    def _dispatch_fallback(self, call):
-        """Fallback when dispatch fails - queue with high priority."""
-        logging.warning(f"Fallback: Queuing call {call.rank} with high priority")
-        self.queued_calls.appendleft(call)  # Add to front of queue
-        return None
-    
-    def _process_queue(self):
-        """Background thread to process queued calls with resilience."""
+        logger.info(f"CallCenter initialized with {len(operators)} operators, "
+                   f"{len(supervisors)} supervisors, {len(directors)} directors")
+        
+    def _start_employee_threads(self) -> None:
+        """Start worker threads for each employee"""
+        all_employees = self.operators + self.supervisors + self.directors
+        for employee in all_employees:
+            thread = threading.Thread(target=self._employee_worker, args=(employee,), daemon=True)
+            thread.start()
+            
+    def _employee_worker(self, employee: Employee) -> None:
+        """Worker thread for processing employee calls"""
         while True:
-            try:
-                if self.queued_calls:
-                    call = self.queued_calls[0]  # Peek without removing
-                    
-                    # Try to dispatch with bulkhead
-                    self._queue_processor.execute(self._try_dispatch_queued, call)
+            time.sleep(0.1)  # Small delay to prevent busy waiting
+            
+            # Check if employee has a call to process
+            if employee.call and employee.call.state == CallState.IN_PROGRESS:
+                # Simulate call processing
+                processing_time = random.uniform(2, 8)
+                time.sleep(processing_time)
                 
-                time.sleep(0.1)  # Small delay to prevent busy waiting
-            except Exception as e:
-                logging.error(f"Queue processor error: {e}")
-                time.sleep(1)  # Back off on error
-    
-    def _try_dispatch_queued(self, call):
-        """Attempt to dispatch a queued call."""
-        # Try to find any available employee
-        for employee_list in [self.operators, self.supervisors, self.directors]:
-            for employee in employee_list:
-                if employee.call is None:
-                    try:
-                        employee.take_call(call)
-                        self.queued_calls.popleft()  # Remove from queue
-                        logging.info(f"Dispatched queued call to {employee.name}")
-                        return
-                    except (CircuitOpenError, BulkheadFullError):
-                        continue
-    
-    def notify_call_escalated(self, call):
-        logging.info(f"Call escalated to {call.level}")
-        # Re-dispatch the escalated call
+                # Randomly decide to complete or escalate
+                if random.random() < 0.8:  # 80% chance to complete
+                    employee.complete_call()
+                else:  # 20% chance to escalate
+                    employee.escalate_call()
+                    
+    def _dispatcher_loop(self) -> None:
+        """Main dispatcher loop for assigning calls to employees"""
+        while self.dispatcher_running:
+            with self.queue_condition:
+                # Wait for calls in queue or timeout
+                self.queue_condition.wait(timeout=1.0)
+                
+                while self.call_queue:
+                    # Get highest priority call
+                    call = heapq.heappop(self.call_queue)
+                    
+                    # Try to assign call
+                    if not self._assign_call(call):
+                        # If assignment failed, requeue with updated priority
+                        call.update_priority()
+                        heapq.heappush(self.call_queue, call)
+                        time.sleep(0.1)  # Prevent busy waiting
+                        
+    def _assign_call(self, call: Call) -> bool:
+        """Assign call to an available employee using load balancing"""
+        employee = self.load_balancer.get_least_loaded_employee(call.rank)
+        
+        if employee and employee.take_call(call):
+            self.load_balancer.update_load(employee, 1)
+            self.metrics.record_call_start(call)
+            return True
+            
+        return False
+        
+    def dispatch_call(self, call: Call) -> None:
+        """Add call to priority queue"""
+        with self.queue_lock:
+            heapq.heappush(self.call_queue, call)
+            self.queue_condition.notify()
+            
+        logger.info(f"Call {call.call_id} added to queue (rank: {call.rank.name})")
+        
+    def get_available_employees(self, rank: Rank) -> List[Employee]:
+        """Get available employees of specified rank"""
+        with self.employee_lock:
+            return [emp for emp in self.available_employees[rank] 
+                   if emp.is_available and not emp._is_circuit_breaker_open()]
+            
+    def notify_call_escalated(self, call: Call) -> None:
+        """Handle call escalation"""
+        with self.employee_lock:
+            # Remove from previous employee's load
+            if call.employee:
+                self.load_balancer.update_load(call.employee, -1)
+                
+        # Requeue the escalated call
+        call.update_priority()
         self.dispatch_call(call)
+        self.metrics.record_call_escalation(call)
+        
+        logger.info(f"Call {call.call_id} requeued after escalation to {call.rank.name}")
+        
+    def notify_call_completed(self, call: Call) -> None:
+        """Handle call completion"""
+        with self.employee_lock:
+            # Update load balancer
+            if call.employee:
+                self.load_balancer.update_load(call.employee, -1)
+                
+        self.metrics.record_call_completion(call)
+        
+        # Try to assign queued calls to newly available employee
+        if call.employee:
+            self._try_assign_queued_calls()
+            
+    def _try_assign_queued_calls(self) -> None:
+        """Try to assign queued calls to available employees"""
+        with self.queue_lock:
+            if not self.call_queue:
+                return
+                
+            # Make a copy of the queue to avoid modification during iteration
+            temp_calls = self.call_queue.copy()
+            self.call_queue.clear()
+            
+            for call in temp_calls:
+                if not self._assign_call(call):
+                    # If assignment failed, keep in queue
+                    heapq.heappush(self.call_queue, call)
+                    
+    def get_queue_size(self) -> int:
+        """Get current queue size"""
+        with self.queue_lock:
+            return len(self.call_queue)
+            
+    def get_employee_status(self) -> Dict:
+        """Get status of all employees"""
+        status = {
+            Rank.OPERATOR.name: {"total": len(self.operators), "available": 0},
+            Rank.SUPERVISOR.name: {"total": len(self.supervisors), "available": 0},
+            Rank.DIRECTOR.name: {"total": len(self.directors), "available": 0}
+        }
+        
+        with self.employee_lock:
+            for rank in [Rank.OPERATOR, Rank.SUPERVISOR, Rank.DIRECTOR]:
+                available = len([emp for emp in self.available_employees[rank] 
+                               if emp.is_available])
+                status[rank.name]["available"] = available
+                
+        return status
+        
+    def shutdown(self) -> None:
+        """Shutdown the call center"""
+        self.dispatcher_running = False
+        with self.queue_condition:
+            self.queue_condition.notify_all()
+            
+        logger.info("CallCenter shutdown initiated")
+        self.metrics.print_metrics()
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Create employees
+    call_center = CallCenter(
+        operators=[Operator(f"op_{i}", f"Operator {i}", None) for i in range(3)],
+        supervisors=[Supervisor(f"sup_{i}", f"Supervisor {i}", None) for i in range(2)],
+        directors=[Director(f"dir_{i}", f"Director {i}", None) for i in range(1)]
+    )
     
-    def notify_call_completed(self, call):
-        logging.info(f"Call completed by {call.employee.name if call.employee else 'unknown'}")
-        # Process next queued call if any
-        if self.queued_calls:
-            self._try_dispatch_queued(self.queued_calls[0])
+    # Set call center references for employees
+    for emp in (call_center.operators + call_center.supervisors + call_center.directors):
+        emp.call_center = call_center
     
-    def shutdown(self):
-        """Graceful shutdown of resilience components."""
-        self._queue_processor.shutdown()
+    # Simulate incoming calls
+    for i in range(10):
+        rank = random.choice([Rank.OPERATOR, Rank.SUPERVISOR, Rank.DIRECTOR])
+        call = Call(rank, f"test_call_{i}")
+        call_center.dispatch_call(call)
+        time.sleep(0.5)
+    
+    # Let system run for a bit
+    time.sleep(30)
+    
+    # Print metrics
+    call_center.metrics.print_metrics()
+    print("\nEmployee Status:")
+    print(call_center.get_employee_status())
+    print(f"Queue Size: {call_center.get_queue_size()}")
+    
+    # Shutdown
+    call_center.shutdown()
